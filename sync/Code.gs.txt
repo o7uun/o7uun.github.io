@@ -1,0 +1,152 @@
+/**
+ * Mr Muscle – Google Health → Google Drive sync (ฟรี)
+ *
+ * ดึงข้อมูลจาก Google Health API (การนอน, HRV, ชีพจรขณะพัก, ก้าวเดิน, การออกกำลังกาย ฯลฯ)
+ * ของบัญชีตัวเอง แล้วเขียนเป็นไฟล์ JSON ลงโฟลเดอร์ "Mr Muscle Health" ใน Google Drive
+ * ให้ Claude อ่านไปวิเคราะห์ทุกเช้า
+ *
+ * ใช้งาน: วางไฟล์นี้ใน Apps Script แล้วกด Run ฟังก์ชัน setup ครั้งเดียว
+ */
+
+const API = 'https://health.googleapis.com/v4/users/me';
+const FOLDER_NAME = 'Mr Muscle Health';
+const LATEST_FILE = 'health-latest.json';
+const DAYS_BACK = 14;           // เก็บย้อนหลังกี่วันในไฟล์ latest
+const TZ = 'Asia/Bangkok';
+
+/** รันครั้งแรกครั้งเดียว: ขอสิทธิ์, ทดสอบดึงข้อมูล, ตั้งเวลาให้รันเองทุกชั่วโมง */
+function setup() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'syncHealth') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('syncHealth').timeBased().everyHours(1).create();
+  const out = syncHealth();
+  Logger.log('ตั้งค่าเสร็จ ไฟล์อยู่ที่: ' + out.url);
+  Logger.log('errors: ' + JSON.stringify(out.errors, null, 2));
+}
+
+/** ดึงข้อมูลแล้วเขียนลง Drive (trigger เรียกทุกชั่วโมง) */
+function syncHealth() {
+  const now = new Date();
+  const start = new Date(now.getTime() - DAYS_BACK * 86400000);
+  const startDate = fmt(start);
+  const endDate = fmt(new Date(now.getTime() + 86400000)); // พรุ่งนี้ (exclusive)
+  const errors = {};
+  const data = {};
+
+  const grab = (key, fn) => {
+    try { data[key] = fn(); } catch (e) { errors[key] = String(e.message || e).slice(0, 800); }
+  };
+
+  // การนอน (ใช้ reconcile ตามที่ Google แนะนำ, กรองด้วยเวลาตื่น)
+  grab('sleep', () => listAll('sleep', ':reconcile',
+    `sleep.interval.civil_end_time >= "${startDate}" AND sleep.interval.civil_end_time < "${endDate}"`, 25)
+    .map(summarizeSleep));
+
+  // ค่ารายวัน
+  grab('daily_resting_heart_rate', () => listAll('daily-resting-heart-rate', '',
+    `daily_resting_heart_rate.date >= "${startDate}" AND daily_resting_heart_rate.date < "${endDate}"`));
+  grab('daily_heart_rate_variability', () => listAll('daily-heart-rate-variability', '',
+    `daily_heart_rate_variability.date >= "${startDate}" AND daily_heart_rate_variability.date < "${endDate}"`));
+  grab('daily_respiratory_rate', () => listAll('daily-respiratory-rate', '',
+    `daily_respiratory_rate.date >= "${startDate}" AND daily_respiratory_rate.date < "${endDate}"`));
+  grab('daily_oxygen_saturation', () => listAll('daily-oxygen-saturation', '',
+    `daily_oxygen_saturation.date >= "${startDate}" AND daily_oxygen_saturation.date < "${endDate}"`));
+  grab('daily_sleep_temperature_derivations', () => listAll('daily-sleep-temperature-derivations', '',
+    `daily_sleep_temperature_derivations.date >= "${startDate}" AND daily_sleep_temperature_derivations.date < "${endDate}"`));
+
+  // กิจกรรม: สรุปรายวัน
+  grab('steps_daily', () => dailyRollUp('steps', start, now));
+  grab('active_zone_minutes_daily', () => dailyRollUp('active-zone-minutes', start, now));
+  grab('total_calories_daily', () => dailyRollUp('total-calories', start, now));
+  grab('distance_daily', () => dailyRollUp('distance', start, now));
+
+  // การออกกำลังกาย
+  grab('exercise', () => listAll('exercise', '',
+    `exercise.interval.civil_start_time >= "${startDate}" AND exercise.interval.civil_start_time < "${endDate}"`, 25));
+
+  const payload = {
+    generated_at: Utilities.formatDate(now, TZ, "yyyy-MM-dd'T'HH:mm:ssXXX"),
+    timezone: TZ,
+    range: { start: startDate, end_exclusive: endDate },
+    note: 'ข้อมูลจาก Google Health API ของเจ้าของบัญชี ใช้สำหรับรายงานตอนเช้าของ Mr Muscle',
+    errors,
+    data,
+  };
+
+  const folder = getFolder();
+  const json = JSON.stringify(payload, null, 1);
+  const latest = writeFile(folder, LATEST_FILE, json);
+  writeFile(folder, 'health-' + fmt(now) + '.json', json); // เก็บประวัติรายวัน
+  return { url: latest.getUrl(), errors };
+}
+
+/** สรุปการนอนให้อ่านง่าย (เก็บ stage รายละเอียดออกเพื่อให้ไฟล์เล็ก) */
+function summarizeSleep(dp) {
+  const s = dp.sleep || {};
+  return {
+    interval: s.interval,
+    type: s.type,
+    metadata: s.metadata,
+    summary: s.summary,
+    short_awakenings_count: (s.shortAwakenings || []).length,
+  };
+}
+
+function listAll(type, suffix, filter, pageSize) {
+  let out = [], token = '';
+  for (let i = 0; i < 20; i++) {
+    let url = `${API}/dataTypes/${type}/dataPoints${suffix}?filter=${encodeURIComponent(filter)}`;
+    if (pageSize) url += `&pageSize=${pageSize}`;
+    if (token) url += `&pageToken=${encodeURIComponent(token)}`;
+    const res = call('get', url);
+    out = out.concat(res.dataPoints || []);
+    token = res.nextPageToken;
+    if (!token) break;
+  }
+  return out;
+}
+
+function dailyRollUp(type, start, end) {
+  const civil = d => {
+    const [y, m, dd] = fmt(d).split('-').map(Number);
+    return { date: { year: y, month: m, day: dd }, time: { hours: 0, minutes: 0, seconds: 0 } };
+  };
+  const endPlus = new Date(end.getTime() + 86400000);
+  const res = call('post', `${API}/dataTypes/${type}/dataPoints:dailyRollUp`, {
+    range: { start: civil(start), end: civil(endPlus) },
+    windowSizeDays: 1,
+  });
+  return res.rollupDataPoints || res;
+}
+
+function call(method, url, body) {
+  const opts = {
+    method,
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken(), Accept: 'application/json' },
+    muteHttpExceptions: true,
+  };
+  if (body) { opts.contentType = 'application/json'; opts.payload = JSON.stringify(body); }
+  const r = UrlFetchApp.fetch(url, opts);
+  const code = r.getResponseCode();
+  if (code >= 300) throw new Error(`HTTP ${code}: ${r.getContentText()}`);
+  return JSON.parse(r.getContentText() || '{}');
+}
+
+function getFolder() {
+  const it = DriveApp.getFoldersByName(FOLDER_NAME);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(FOLDER_NAME);
+}
+
+function writeFile(folder, name, content) {
+  const it = folder.getFilesByName(name);
+  if (it.hasNext()) { const f = it.next(); f.setContent(content); return f; }
+  return folder.createFile(name, content, 'application/json');
+}
+
+function fmt(d) { return Utilities.formatDate(d, TZ, 'yyyy-MM-dd'); }
+
+/** ใช้เช็คว่าบัญชีเชื่อมกับ Google Health แล้วหรือยัง */
+function testIdentity() {
+  Logger.log(JSON.stringify(call('get', API + '/identity'), null, 2));
+}
