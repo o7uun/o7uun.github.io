@@ -5,7 +5,7 @@
  * ของบัญชีตัวเอง แล้วเขียนเป็นไฟล์ JSON ลงโฟลเดอร์ "Mr Muscle Health" ใน Google Drive
  * ให้ Claude อ่านไปวิเคราะห์ทุกเช้า
  *
- * ใช้งาน: วางไฟล์นี้ใน Apps Script แล้วกด Run ฟังก์ชัน setup ครั้งเดียว
+ * ใช้งาน: ใส่ Script Properties, รัน authorize แล้วเปิดลิงก์, จากนั้นรัน setup
  */
 
 const API = 'https://health.googleapis.com/v4/users/me';
@@ -14,7 +14,82 @@ const LATEST_FILE = 'health-latest.json';
 const DAYS_BACK = 14;           // เก็บย้อนหลังกี่วันในไฟล์ latest
 const TZ = 'Asia/Bangkok';
 
-/** รันครั้งแรกครั้งเดียว: ขอสิทธิ์, ทดสอบดึงข้อมูล, ตั้งเวลาให้รันเองทุกชั่วโมง */
+/*
+ * Google Health API ไม่รับ token ที่มีสิทธิ์อื่นปน (เช่น Drive) จึงต้องขอสิทธิ์ Health แยก
+ * ผ่าน OAuth client ของเราเอง เก็บ refresh token ไว้ใน Script Properties
+ * ต้องตั้ง Script Properties: HEALTH_CLIENT_ID, HEALTH_CLIENT_SECRET
+ */
+const HEALTH_SCOPES = [
+  'https://www.googleapis.com/auth/googlehealth.sleep.readonly',
+  'https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly',
+  'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly',
+].join(' ');
+
+function props() { return PropertiesService.getScriptProperties(); }
+function redirectUri() {
+  return 'https://script.google.com/macros/d/' + ScriptApp.getScriptId() + '/usercallback';
+}
+
+/** ขั้นที่ 1: รันฟังก์ชันนี้ แล้วเปิดลิงก์ใน Execution log เพื่อกดอนุญาต Google Health */
+function authorize() {
+  const p = props();
+  const clientId = p.getProperty('HEALTH_CLIENT_ID');
+  if (!clientId || !p.getProperty('HEALTH_CLIENT_SECRET')) {
+    throw new Error('ยังไม่ได้ใส่ HEALTH_CLIENT_ID / HEALTH_CLIENT_SECRET ใน Script Properties');
+  }
+  const state = ScriptApp.newStateToken().withMethod('authCallback').withTimeout(3600).createToken();
+  const url = 'https://accounts.google.com/o/oauth2/v2/auth?' + [
+    'client_id=' + encodeURIComponent(clientId),
+    'redirect_uri=' + encodeURIComponent(redirectUri()),
+    'response_type=code',
+    'scope=' + encodeURIComponent(HEALTH_SCOPES),
+    'access_type=offline',
+    'prompt=consent',
+    'state=' + encodeURIComponent(state),
+  ].join('&');
+  Logger.log('เปิดลิงก์นี้เพื่ออนุญาต Google Health:\n' + url);
+  return url;
+}
+
+function authCallback(request) {
+  const code = request.parameter.code;
+  if (!code) return HtmlService.createHtmlOutput('ไม่สำเร็จ: ' + JSON.stringify(request.parameter));
+  const p = props();
+  const r = UrlFetchApp.fetch('https://oauth2.googleapis.com/token', {
+    method: 'post', muteHttpExceptions: true,
+    payload: {
+      code, grant_type: 'authorization_code', redirect_uri: redirectUri(),
+      client_id: p.getProperty('HEALTH_CLIENT_ID'), client_secret: p.getProperty('HEALTH_CLIENT_SECRET'),
+    },
+  });
+  const t = JSON.parse(r.getContentText());
+  if (!t.refresh_token) return HtmlService.createHtmlOutput('ไม่สำเร็จ: ' + r.getContentText());
+  p.setProperty('HEALTH_REFRESH_TOKEN', t.refresh_token);
+  CacheService.getScriptCache().put('health_at', t.access_token, 3000);
+  return HtmlService.createHtmlOutput('<h2>เชื่อม Google Health สำเร็จ ✅</h2><p>ปิดหน้านี้ได้เลย แล้วกลับไปรัน setup</p>');
+}
+
+function healthToken() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('health_at');
+  if (cached) return cached;
+  const p = props();
+  const rt = p.getProperty('HEALTH_REFRESH_TOKEN');
+  if (!rt) throw new Error('ยังไม่ได้อนุญาต Google Health: รันฟังก์ชัน authorize ก่อน');
+  const r = UrlFetchApp.fetch('https://oauth2.googleapis.com/token', {
+    method: 'post', muteHttpExceptions: true,
+    payload: {
+      refresh_token: rt, grant_type: 'refresh_token',
+      client_id: p.getProperty('HEALTH_CLIENT_ID'), client_secret: p.getProperty('HEALTH_CLIENT_SECRET'),
+    },
+  });
+  const t = JSON.parse(r.getContentText());
+  if (!t.access_token) throw new Error('ต่ออายุสิทธิ์ Google Health ไม่ได้ (รัน authorize ใหม่): ' + r.getContentText());
+  cache.put('health_at', t.access_token, Math.max(60, (t.expires_in || 3600) - 300));
+  return t.access_token;
+}
+
+/** ขั้นที่ 2: รันครั้งเดียว: ทดสอบดึงข้อมูล แล้วตั้งเวลาให้รันเองทุกชั่วโมง */
 function setup() {
   ScriptApp.getProjectTriggers().forEach(t => {
     if (t.getHandlerFunction() === 'syncHealth') ScriptApp.deleteTrigger(t);
@@ -123,7 +198,7 @@ function dailyRollUp(type, start, end) {
 function call(method, url, body) {
   const opts = {
     method,
-    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken(), Accept: 'application/json' },
+    headers: { Authorization: 'Bearer ' + healthToken(), Accept: 'application/json' },
     muteHttpExceptions: true,
   };
   if (body) { opts.contentType = 'application/json'; opts.payload = JSON.stringify(body); }
